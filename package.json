@@ -1,0 +1,14 @@
+{
+  "name": "mfz-invoice-system",
+  "version": "1.0.0",
+  "description": "MFZ Invoice System - invois, sebut harga, inventori, pelanggan dan laporan (Supabase)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
