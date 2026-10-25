@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ms">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Log Masuk - MFZ Invoice System</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f766e'/%3E%3Ctext x='16' y='22' font-size='15' font-family='Arial' font-weight='700' text-anchor='middle' fill='white'%3EMFZ%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body class="auth-body">
+  <main class="auth-wrap">
+    <div class="auth-brand"><span class="logo">MFZ</span><div><b>MFZ Invoice System</b><small>Log masuk untuk teruskan</small></div></div>
+    <form class="card auth-card" id="f" autocomplete="on">
+      <label class="fld">Nama pengguna
+        <input type="text" id="u" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus></label>
+      <label class="fld">Kata laluan
+        <input type="password" id="p" name="password" autocomplete="current-password" required></label>
+      <div class="auth-err" id="err" role="alert" hidden></div>
+      <button class="btn primary wide" id="go" type="submit">Log Masuk</button>
+    </form>
+  </main>
+  <script src="js/login.js"></script>
+</body>
+</html>

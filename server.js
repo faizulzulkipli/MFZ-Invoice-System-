@@ -7,9 +7,9 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { buildDocPdf } = require('./lib/pdf');
+const crypto = require('crypto');
 
-// ---------- .env (parser ringkas) ----------
+// ---------- .env (parser ringkas; mesti sebelum lib/config dimuat) ----------
 try {
   fs.readFileSync(path.join(__dirname, '.env'), 'utf8').split(/\r?\n/).forEach((line) => {
     const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/i);
@@ -18,41 +18,51 @@ try {
   });
 } catch (_) { /* tiada .env - guna environment sistem */ }
 
-const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const { buildDocPdf } = require('./lib/pdf');
+const { cfg, save: saveConfig, normalizeUrl, keyProblem, projectRef } = require('./lib/config');
+const A = require('./lib/auth');
+
 const PORT = Number(process.env.PORT || 3000);
 const APP_USER = process.env.APP_USER || '';
 const APP_PASSWORD = process.env.APP_PASSWORD || '';
-
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('\n[RALAT] SUPABASE_URL dan SUPABASE_SERVICE_ROLE_KEY belum ditetapkan.\n' +
-    'Salin .env.example kepada .env dan isi maklumat projek Supabase anda.\n');
-  process.exit(1);
-}
+// Admin melalui environment (pilihan; menggantikan akaun yang dicipta di halaman setup)
+const ENV_ADMIN = APP_USER && APP_PASSWORD ? { username: APP_USER, password: APP_PASSWORD } : null;
+const envSecret = () => crypto.createHash('sha256').update(`${APP_USER}\n${APP_PASSWORD}\n${cfg.key}`).digest('hex');
 
 // ---------- Klien PostgREST ringkas ----------
-async function rest(method, pathAndQuery, body, headers = {}) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${pathAndQuery}`, {
-    method,
-    headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=representation',
-      ...headers,
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+async function restWith(url, key, method, pathAndQuery, body, headers = {}) {
+  let res;
+  try {
+    res = await fetch(`${url}/rest/v1/${pathAndQuery}`, {
+      method,
+      redirect: 'error',
+      signal: AbortSignal.timeout(15000),
+      headers: {
+        apikey: key,
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+        ...headers,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (e) {
+    throw Object.assign(new Error('Tidak dapat menghubungi Supabase. Semak URL projek dan sambungan internet.'), { status: 502, code: 'NETWORK' });
+  }
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (_) { data = { message: text }; }
   if (!res.ok) {
-    const err = new Error((data && data.message) || res.statusText);
+    const err = new Error((data && (data.message || data.msg || data.error_description)) || res.statusText);
     err.code = data && data.code;
     err.status = res.status;
     throw err;
   }
   return data;
+}
+function rest(...args) {
+  if (!cfg.url) throw Object.assign(new Error('Sambungan Supabase belum ditetapkan.'), { status: 503 });
+  return restWith(cfg.url, cfg.key, ...args);
 }
 const rpc = (fn, args) => rest('POST', `rpc/${fn}`, args || {});
 
@@ -82,6 +92,8 @@ function friendly(e) {
   if (e.code === '23503') return 'Rekod ini sedang digunakan oleh data lain (cth. invois/sebut harga), jadi tidak boleh dipadam.';
   if (e.code === '23505') return 'Nombor / kod ini sudah wujud. Sila guna yang lain.';
   if (e.code === '23514') return 'Data tidak sah (semak nilai yang dimasukkan).';
+  if (e.code === '42501' || /permission denied/i.test(e.message || ''))
+    return 'Kebenaran pangkalan data ditolak. Pastikan SUPABASE_SERVICE_ROLE_KEY ialah kunci service_role (bukan anon), dan jalankan semula database/schema.sql di Supabase.';
   if (e.code === 'PGRST202' || /Could not find the function/i.test(e.message || ''))
     return 'Fungsi pangkalan data tidak dijumpai. Pastikan database/schema.sql telah dijalankan di Supabase.';
   if (e.code === 'PGRST205' || /Could not find the table/i.test(e.message || ''))
@@ -308,14 +320,6 @@ function sendJson(res, status, data) {
   res.end(s);
 }
 
-function authorized(req) {
-  if (!APP_USER && !APP_PASSWORD) return true;
-  const h = req.headers.authorization || '';
-  if (!h.startsWith('Basic ')) return false;
-  const [u, ...p] = Buffer.from(h.slice(6), 'base64').toString().split(':');
-  return u === APP_USER && p.join(':') === APP_PASSWORD;
-}
-
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
@@ -325,17 +329,185 @@ function readBody(req) {
   });
 }
 
+// ---------- Admin, semakan skema & status setup ----------
+let adminCache = { at: 0, val: null };
+async function getAdmin(force) {
+  if (ENV_ADMIN) return { username: ENV_ADMIN.username, env: true, secret: envSecret() };
+  if (!cfg.url) return null;
+  const ttl = adminCache.val ? 30000 : 2000;
+  if (!force && Date.now() - adminCache.at < ttl) return adminCache.val;
+  try {
+    const rows = await rest('GET', 'app_admin?select=username,password_hash,secret&id=eq.1&limit=1');
+    adminCache = { at: Date.now(), val: rows[0] || null };
+  } catch (_) {
+    adminCache = { at: Date.now() - ttl + 5000, val: adminCache.val };   // gangguan sementara: kekalkan nilai lama
+  }
+  return adminCache.val;
+}
+const isComplete = async () => !!cfg.url && !!(await getAdmin());
+
+async function checkSchema(url, key) {
+  const tries = [
+    () => restWith(url, key, 'GET', 'company_settings?select=id&limit=1'),
+    () => restWith(url, key, 'GET', 'app_admin?select=id&limit=1'),
+    () => restWith(url, key, 'POST', 'rpc/report_summary', { p_from: '2000-01-01', p_to: '2000-01-01' }),
+  ];
+  for (const t of tries) {
+    try { await t(); } catch (e) {
+      if (e.code === 'NETWORK') return { status: 'network', message: e.message };
+      if (e.code === '42501' || e.status === 401 || e.status === 403)
+        return { status: 'forbidden', message: 'Kunci ditolak oleh Supabase. Pastikan ia kunci service_role projek ini.' };
+      if (e.code === 'PGRST205' || e.code === 'PGRST202' || e.status === 404)
+        return { status: 'missing', message: 'Jadual / fungsi pangkalan data belum lengkap. Jalankan schema.sql di SQL Editor Supabase.' };
+      return { status: 'error', message: e.message };
+    }
+  }
+  return { status: 'ok' };
+}
+
+async function setupStatus() {
+  const configured = !!cfg.url;
+  if (configured && (await getAdmin(true))) return { complete: true };
+  const ref = projectRef(cfg.url);
+  return {
+    complete: false, configured, source: cfg.source, url: cfg.url || null, adminFromEnv: !!ENV_ADMIN,
+    schema: configured ? await checkSchema(cfg.url, cfg.key) : null,
+    sqlEditor: ref ? `https://supabase.com/dashboard/project/${ref}/sql/new` : null,
+  };
+}
+
+const setupLimit = A.limiter(40, 10 * 60e3);
+const loginLimit = A.limiter(8, 15 * 60e3);
+
+async function session(req) {
+  const admin = await getAdmin();
+  if (!admin) return null;
+  const tok = A.readToken(A.parseCookies(req.headers.cookie)[A.COOKIE], admin.secret);
+  return tok && A.safeEq(tok.u, admin.username) ? tok : null;
+}
+const sessionFor = (admin) => A.makeToken(admin.username, admin.secret);
+
+// ---------- API setup (hanya sebelum setup selesai) ----------
+async function setupApi(req, res, url, complete) {
+  const p = url.pathname;
+  if (p === '/api/setup/status' && req.method === 'GET') return sendJson(res, 200, complete ? { complete: true } : await setupStatus());
+  if (complete) return sendJson(res, 403, { error: 'Setup sudah selesai.' });
+  const ip = A.clientIp(req);
+  if (setupLimit.blocked(ip)) return sendJson(res, 429, { error: 'Terlalu banyak percubaan. Cuba lagi sebentar.' });
+
+  if (p === '/api/setup/schema' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(fs.readFileSync(path.join(__dirname, 'database', 'schema.sql')));
+  }
+
+  if (p === '/api/setup/connect' && req.method === 'POST') {
+    setupLimit.fail(ip);
+    const b = await readBody(req);
+    if (cfg.url) {
+      if (cfg.source === 'env') throw httpError(409, 'Sambungan ditetapkan melalui environment variable dan tidak boleh diubah di sini.');
+      if (!A.safeEq(b.currentKey, cfg.key)) throw httpError(409, 'Sambungan sudah ditetapkan.');
+    }
+    const urlN = normalizeUrl(b.url);
+    const problem = keyProblem(b.key);
+    if (problem) throw httpError(400, problem);
+    const key = String(b.key).trim();
+    const schema = await checkSchema(urlN, key);
+    if (['network', 'forbidden', 'error'].includes(schema.status)) throw httpError(400, schema.message);
+    try { saveConfig(urlN, key); } catch (e) {
+      throw httpError(500, 'Tidak dapat menyimpan konfigurasi pada pelayan ini (' + e.code + '). Tetapkan SUPABASE_URL dan SUPABASE_SERVICE_ROLE_KEY sebagai environment variable.');
+    }
+    adminCache = { at: 0, val: null };
+    return sendJson(res, 200, await setupStatus());
+  }
+
+  if (p === '/api/setup/admin' && req.method === 'POST') {
+    setupLimit.fail(ip);
+    const b = await readBody(req);
+    if (!cfg.url) throw httpError(400, 'Sila tetapkan sambungan Supabase dahulu.');
+    if (!A.safeEq(b.key, cfg.key)) throw httpError(403, 'Kunci service_role tidak sepadan dengan sambungan yang ditetapkan.');
+    if (ENV_ADMIN) throw httpError(409, 'Akaun admin ditetapkan melalui APP_USER / APP_PASSWORD.');
+    const username = String(b.username || '').trim();
+    const password = String(b.password || '');
+    if (!/^[A-Za-z0-9._@-]{3,40}$/.test(username)) throw httpError(400, 'Nama pengguna 3-40 aksara (huruf, nombor, . _ @ -).');
+    if (password.length < 8 || password.length > 200) throw httpError(400, 'Kata laluan mesti sekurang-kurangnya 8 aksara.');
+    const schema = await checkSchema(cfg.url, cfg.key);
+    if (schema.status !== 'ok') throw httpError(400, schema.message || 'Skema pangkalan data belum lengkap.');
+    if (await getAdmin(true)) throw httpError(409, 'Akaun admin sudah wujud.');
+    const row = { id: 1, username, password_hash: A.hashPassword(password), secret: crypto.randomBytes(32).toString('hex') };
+    try { await rest('POST', 'app_admin', row, { Prefer: 'return=minimal' }); } catch (e) {
+      if (e.code === '23505') throw httpError(409, 'Akaun admin sudah wujud.');
+      throw e;
+    }
+    adminCache = { at: Date.now(), val: row };
+    res.setHeader('Set-Cookie', A.sessionCookie(sessionFor(row), req));
+    return sendJson(res, 200, { ok: true });
+  }
+  return sendJson(res, 404, { error: 'API tidak dijumpai' });
+}
+
+// ---------- Fail statik & pelayan ----------
+function serveStatic(res, pathname) {
+  let rel = decodeURIComponent(pathname);
+  if (rel === '/') rel = '/index.html';
+  const file = path.normalize(path.join(PUBLIC, rel));
+  if (!file.startsWith(PUBLIC + path.sep)) { res.writeHead(403); return res.end('Dilarang'); }
+  fs.readFile(file, (err, buf) => {
+    if (err) { res.writeHead(404); return res.end('Tidak dijumpai'); }
+    const ext = path.extname(file);
+    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Cache-Control': 'no-cache',
+      'X-Content-Type-Options': 'nosniff', ...(ext === '.html' ? { 'X-Frame-Options': 'DENY' } : {}) });
+    res.end(buf);
+  });
+}
+const redirect = (res, to) => { res.writeHead(302, { Location: to, 'Cache-Control': 'no-store' }); res.end(); };
+
 const server = http.createServer(async (req, res) => {
   try {
-    if (!authorized(req)) {
-      res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="MFZ Invoice System"' });
-      return res.end('Perlu log masuk');
-    }
     const url = new URL(req.url, 'http://localhost');
-    if (url.pathname.startsWith('/api/')) {
+    const p = url.pathname;
+    const isApi = p.startsWith('/api/');
+
+    if (/^\/(css|js)\//.test(p)) return serveStatic(res, p);          // kod frontend (bukan rahsia)
+
+    const complete = await isComplete();
+    if (p.startsWith('/api/setup/')) return await setupApi(req, res, url, complete);
+
+    if (!complete) {                                                   // belum disetup -> halaman setup sahaja
+      if (p === '/setup.html') return serveStatic(res, p);
+      if (isApi) return sendJson(res, 503, { error: 'Setup belum selesai.', setup: true });
+      return redirect(res, '/setup.html');
+    }
+    if (p === '/setup.html') return redirect(res, '/');
+
+    if (p === '/api/login' && req.method === 'POST') {
+      const ip = A.clientIp(req);
+      if (loginLimit.blocked(ip)) throw httpError(429, 'Terlalu banyak percubaan log masuk. Cuba lagi dalam 15 minit.');
+      const b = await readBody(req);
+      const admin = await getAdmin();
+      const ok = admin && A.safeEq(b.username, admin.username) &&
+        (admin.env ? A.safeEq(b.password, ENV_ADMIN.password) : A.verifyPassword(b.password, admin.password_hash));
+      if (!ok) { loginLimit.fail(ip); throw httpError(401, 'Nama pengguna atau kata laluan salah.'); }
+      loginLimit.reset(ip);
+      res.setHeader('Set-Cookie', A.sessionCookie(sessionFor(admin), req));
+      return sendJson(res, 200, { ok: true });
+    }
+    if (p === '/login.html') return (await session(req)) ? redirect(res, '/') : serveStatic(res, p);
+
+    const sess = await session(req);
+    if (!sess) {
+      if (isApi) return sendJson(res, 401, { error: 'Sesi tamat. Sila log masuk semula.', login: true });
+      return redirect(res, '/login.html');
+    }
+    if (p === '/api/logout' && req.method === 'POST') {
+      res.setHeader('Set-Cookie', A.sessionCookie('', req, true));
+      return sendJson(res, 200, { ok: true });
+    }
+    if (p === '/api/me') return sendJson(res, 200, { username: sess.u });
+
+    if (isApi) {
       for (const r of ROUTES) {
         if (r.method !== req.method) continue;
-        const m = url.pathname.match(r.re);
+        const m = p.match(r.re);
         if (!m) continue;
         const body = ['POST', 'PUT', 'PATCH'].includes(req.method) ? await readBody(req) : {};
         const out = await r.fn({ body, params: m.slice(1), query: url.searchParams });
@@ -347,16 +519,7 @@ const server = http.createServer(async (req, res) => {
       }
       return sendJson(res, 404, { error: 'API tidak dijumpai' });
     }
-    // fail statik
-    let rel = decodeURIComponent(url.pathname);
-    if (rel === '/') rel = '/index.html';
-    const file = path.normalize(path.join(PUBLIC, rel));
-    if (!file.startsWith(PUBLIC + path.sep)) { res.writeHead(403); return res.end('Dilarang'); }
-    fs.readFile(file, (err, buf) => {
-      if (err) { res.writeHead(404); return res.end('Tidak dijumpai'); }
-      res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
-      res.end(buf);
-    });
+    return serveStatic(res, p);
   } catch (e) {
     const status = e.status && e.status >= 400 && e.status < 600 ? e.status : 400;
     if (status >= 500) console.error(e);
@@ -366,5 +529,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`MFZ Invoice System berjalan di http://localhost:${PORT}`);
-  console.log(`Supabase: ${SUPABASE_URL}${APP_USER ? '  |  Log masuk: DIAKTIFKAN' : '  |  Log masuk: tidak aktif (tetapkan APP_USER & APP_PASSWORD)'}`);
+  if (!cfg.url) console.log('Belum disetup: buka alamat di atas dalam pelayar untuk melengkapkan setup kali pertama.');
+  else console.log(`Supabase: ${cfg.url} (sumber: ${cfg.source})  |  Admin: ${ENV_ADMIN ? 'dari environment' : 'dalam pangkalan data'}`);
 });

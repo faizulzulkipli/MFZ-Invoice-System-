@@ -22,7 +22,11 @@ const badge = (s, map) => `<span class="badge b-${esc(s)}">${esc(map[s] || s)}</
 async function api(method, url, body) {
   const res = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Ralat pelayan (${res.status})`);
+  if (!res.ok) {
+    if (data.login) location.href = '/login.html';          // sesi tamat
+    else if (data.setup) location.href = '/setup.html';     // setup belum selesai
+    throw new Error(data.error || `Ralat pelayan (${res.status})`);
+  }
   return data;
 }
 
@@ -170,6 +174,8 @@ VIEWS.settings = async () => {
 async function boot() {
   $('#menuBtn').onclick = () => $('#sidebar').classList.toggle('open');
   window.addEventListener('hashchange', router);
+  $('#logoutBtn').onclick = async () => { try { await api('POST', '/api/logout'); } catch (_) { /* abaikan */ } location.href = '/login.html'; };
+  api('GET', '/api/me').then((m) => { $('#meUser').textContent = m.username; }).catch(() => {});
   try { state.settings = await api('GET', '/api/settings'); $('#brandCo').textContent = state.settings.company_name; }
   catch (e) { toast(e.message, true); }
   router();

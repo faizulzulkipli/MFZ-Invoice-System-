@@ -6,23 +6,44 @@ Sistem invois lengkap (rujukan Bukku.my): invois, sebut harga, inventori, pelang
 mfz-invoice/
 ├─ database/schema.sql   ← jalankan di Supabase SQL Editor (jadual + fungsi + data default)
 ├─ server.js             ← backend Node.js (tiada pakej luar), sambung terus ke Supabase
+├─ lib/config.js         ← konfigurasi sambungan Supabase (env / data/config.json)
+├─ lib/auth.js           ← hash kata laluan, sesi, had cubaan
 ├─ lib/pdf.js            ← penjana PDF A5 (vektor) di server, tanpa pakej luar
-├─ public/               ← frontend (HTML/CSS/JS)
+├─ public/               ← frontend (index, setup.html, login.html, css, js)
 ├─ .env.example          ← salin kepada .env
 └─ package.json
 ```
 
-## Pemasangan (5 langkah)
+## Pemasangan
 
 1. **Cipta projek** di https://supabase.com (percuma).
-2. **Cipta database:** Supabase Dashboard → *SQL Editor* → *New query* → tampal seluruh `database/schema.sql` → **Run**.
-   Ia mencipta semua jadual, fungsi laporan, dan memasukkan data default (tetapan syarikat, 6 pelanggan, 10 produk, 30 invois + bayaran sepanjang ~12 bulan, 4 sebut harga). Selamat dijalankan berulang kali — data contoh hanya dimasukkan jika jadual kosong.
-3. **Ambil kunci:** *Project Settings → API* → salin **Project URL** dan **service_role key**.
-4. **Konfigurasi:** `cp .env.example .env` kemudian isi `SUPABASE_URL` dan `SUPABASE_SERVICE_ROLE_KEY`.
-5. **Jalankan** (perlu Node.js 18+): `node server.js` → buka http://localhost:3000
+2. **Jalankan** (Node.js 18+, tiada `npm install`): `node server.js` → buka http://localhost:3000
+3. **Ikut halaman setup kali pertama** yang terbuka sendiri:
+   1. **Sambungan Supabase** — tampal *Project URL* dan kunci **service_role** (*Project Settings → API*). Sambungan diuji sebelum disimpan.
+   2. **Cipta database** — jika jadual belum ada, halaman setup memaparkan butang **Salin SQL**. Tampal di *SQL Editor* Supabase, tekan **Run**, kemudian klik **Semak semula**. Ia mencipta jadual, fungsi laporan dan data default (tetapan syarikat, 6 pelanggan, 10 produk, 30 invois + bayaran, 4 sebut harga). Selamat dijalankan berulang kali.
+   3. **Akaun admin** — tetapkan nama pengguna dan kata laluan (min. 8 aksara). Selepas itu anda log masuk automatik.
 
-> `service_role` key hanya berada di server (`.env`) dan tidak pernah dihantar ke pelayar. Semua jadual dikunci dengan RLS, jadi anon key tidak boleh membaca data. **Jangan commit `.env` ke Git.**
-> Jika sistem dihoskan di internet, tetapkan `APP_USER` dan `APP_PASSWORD` dalam `.env` untuk log masuk asas.
+Seterusnya sistem menunjukkan halaman **Log Masuk**; sesi bertahan 7 hari. Butang **Log keluar** ada di bawah sidebar.
+
+### Di mana tetapan disimpan?
+| Item | Disimpan di | Nota |
+|---|---|---|
+| URL + kunci Supabase | `data/config.json` (kebenaran 600, tidak masuk Git) **atau** environment variable | Environment `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` diutamakan. |
+| Akaun admin | Jadual `app_admin` dalam Supabase (kata laluan di-hash scrypt) | Kekal walaupun pelayan dideploy semula. |
+
+> **Hosting seperti Render (pelan percuma):** sistem fail dikosongkan setiap deploy, jadi `data/config.json` hilang. Letakkan `SUPABASE_URL` dan `SUPABASE_SERVICE_ROLE_KEY` dalam *Environment*. Halaman setup hanya akan meminta langkah 2 dan 3 (cipta admin), dan akaun admin kekal dalam Supabase.
+> Alternatif lama `APP_USER` + `APP_PASSWORD` (environment) masih berfungsi: ia menjadi akaun admin dan langkah cipta admin dilangkau.
+
+### Keselamatan setup
+- Halaman setup hanya aktif **sebelum** setup selesai; selepas itu ia ditutup (403) dan `/setup.html` dialihkan.
+- Mencipta admin memerlukan kunci **service_role** (bukti pemilik), jadi orang lain yang sempat membuka URL anda dahulu tidak boleh merampas akaun admin.
+- URL Supabase dihadkan kepada `https://<projek>.supabase.co` (menghalang SSRF). Untuk Supabase self-hosted / ujian tempatan tetapkan `ALLOW_CUSTOM_SUPABASE_URL=1`.
+- Kunci `anon` / `publishable` ditolak. Log masuk dihadkan 8 percubaan gagal / 15 minit setiap IP.
+- Kunci `service_role` hanya berada di server dan tidak pernah dihantar ke pelayar. Semua jadual dikunci dengan RLS. **Jangan commit `.env` atau `data/` ke Git.**
+
+### Terlupa kata laluan / tukar sambungan
+- **Kata laluan:** di SQL Editor Supabase jalankan `delete from app_admin;` kemudian buka semula `/setup.html` dan cipta akaun baharu (perlu kunci service_role).
+- **Tukar projek Supabase:** padam `data/config.json` (atau tukar environment variable) dan restart.
 
 ## Ciri
 
